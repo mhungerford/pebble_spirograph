@@ -13,8 +13,8 @@ static BitmapLayer *render_layer = NULL;
 static GBitmap *bitmap = NULL;
 
 
-GFont *lcd_date_font = NULL;
-GFont *lcd_time_font = NULL;
+GFont lcd_date_font = NULL;
+GFont lcd_time_font = NULL;
 GBitmap *mask = NULL;
 
 //Digital Time Display
@@ -61,8 +61,8 @@ static GPoint tick_point_12;
       (GPoint){CAT(tick_point_, hour).x - 16, CAT(tick_point_, hour).y - 10}, .size = {32,32}}, \
       GTextOverflowModeFill, GTextAlignmentCenter, NULL)
 
-static GFont *custom_font_text = NULL;
-static GFont *custom_font_outline = NULL;
+static GFont custom_font_text = NULL;
+static GFont custom_font_outline = NULL;
 
 static Layer *analog_layer;
 
@@ -431,8 +431,33 @@ bool draw_spirograph(GContext* ctx, int x, int y, int outer, int inner, int dist
 
 // GBitmap and GContext are opaque types, so provide just enough here to allow
 // offscreen rendering into a bitmap
+typedef struct BitmapInfo {
+  bool is_bitmap_heap_allocated:1;
+  GBitmapFormat format:3;
+  bool is_palette_heap_allocated:1;
+  uint16_t reserved:7;
+  uint8_t version:4;
+} BitmapInfo;
+
+typedef struct {
+  uint16_t offset;
+  uint8_t min_x;
+  uint8_t max_x;
+} GBitmapDataRowInfoInternal;
+
+static GBitmapDataRowInfoInternal row_info[180] = {};
+static bool info_setup = false;
+
 typedef struct MyGBitmap {
   void *addr;
+  uint16_t row_size_bytes;
+  union {
+    //! Bitfields of metadata flags.
+    uint16_t info_flags;
+    BitmapInfo info;
+  };
+  GRect bounds;
+  GBitmapDataRowInfoInternal *data_row_infos;
 } MyGBitmap;
 
 typedef struct MyGContext {
@@ -441,19 +466,34 @@ typedef struct MyGContext {
 
 static void update_display(Layer* layer, GContext *ctx) {
   GRect bounds = layer_get_bounds(layer);
+  const GPoint center = grect_center_point(&bounds);
   bool retval = true;
   static int idx = 0;
   int num_patterns = sizeof(patterns) / sizeof(Pattern);
 
+  if (!info_setup) {
+    info_setup = true;
+    for (int i = 0; i < 180; i++) {
+      row_info[i].offset = i * 180;
+      row_info[i].min_x = 0;
+      row_info[i].max_x = 180;
+    }
+  }
+
   graphics_context_set_compositing_mode(ctx, GCompOpAssign);
 
   //backup old dest_bitmap addr
-  char *orig_addr = ((MyGContext*)ctx)->dest_bitmap.addr;
+  uint8_t *orig_addr = gbitmap_get_data((GBitmap*)(&((MyGContext*)ctx)->dest_bitmap));
+  GBitmapFormat orig_format = gbitmap_get_format((GBitmap*)(&((MyGContext*)ctx)->dest_bitmap));
+  GBitmapDataRowInfoInternal *orig_row_info = ((MyGContext*)ctx)->dest_bitmap.data_row_infos;
 
   //replace screen bitmap with our offscreen render bitmap
-  ((MyGContext*)ctx)->dest_bitmap.addr = ((MyGBitmap*)bitmap)->addr;
+  gbitmap_set_data((GBitmap*)(&((MyGContext*)ctx)->dest_bitmap), gbitmap_get_data(bitmap),
+    GBitmapFormat8BitCircular, gbitmap_get_bytes_per_row(bitmap), false);
+    //gbitmap_get_format(bitmap), gbitmap_get_bytes_per_row(bitmap), false);
+  ((MyGContext*)ctx)->dest_bitmap.data_row_infos = row_info;
 
-  retval = draw_spirograph(ctx, 72, 84, 
+  retval = draw_spirograph(ctx, center.x, center.y, 
       patterns[idx].R, patterns[idx].r, patterns[idx].d);
   
   if (!retval) {
@@ -472,27 +512,53 @@ static void update_display(Layer* layer, GContext *ctx) {
   }
 
   //restore original context bitmap
-  ((MyGContext*)ctx)->dest_bitmap.addr = orig_addr;
+  gbitmap_set_data((GBitmap*)(&((MyGContext*)ctx)->dest_bitmap), orig_addr, orig_format, 0, false);
+  ((MyGContext*)ctx)->dest_bitmap.data_row_infos = orig_row_info;
 
   //draw the bitmap to the screen
   graphics_draw_bitmap_in_rect(ctx, bitmap, bounds);
 }
 
+static bool looking = false;
 static void register_timer(void* data) {
-  app_timer_register(50, register_timer, data);
-  layer_mark_dirty(bitmap_layer_get_layer(render_layer));
+  if (looking) {
+    app_timer_register(50, register_timer, data);
+    layer_mark_dirty(bitmap_layer_get_layer(render_layer));
+  }
+}
+
+#define ACCEL_DEADZONE 100
+#define WITHIN(n, min, max) (((n)>=(min) && (n) <= (max)) ? true : false)
+
+void accel_handler(AccelData *data, uint32_t num_samples) {
+  for (uint32_t i = 0; i < num_samples; i++) {
+    if(
+        WITHIN(data[i].x, -400, 400) &&
+        WITHIN(data[i].y, -900, 0) &&
+        WITHIN(data[i].z, -1100, -300)) {
+      if (!looking) {
+        looking = true;
+        light_enable(true);
+        register_timer(NULL);
+      }
+      return;
+    }
+  }
+  looking = false;
+  light_enable(false);
 }
 
 static void window_load(Window *window) {
   Layer *window_layer = window_get_root_layer(window);
   GRect bounds = layer_get_bounds(window_layer);
+  const GPoint center = grect_center_point(&bounds);
 
   render_layer = bitmap_layer_create(bounds);
   bitmap = gbitmap_create_blank(bounds.size, GBitmapFormat8Bit);
   bitmap_layer_set_bitmap(render_layer, bitmap);
   layer_set_update_proc(bitmap_layer_get_layer(render_layer), update_display);
   layer_add_child(window_layer, bitmap_layer_get_layer(render_layer));
-  register_timer(NULL);
+  //register_timer(NULL);
 
   custom_font_text = fonts_load_custom_font(resource_get_handle(RESOURCE_ID_FONT_BOXY_TEXT_20));
   custom_font_outline = fonts_load_custom_font(resource_get_handle(RESOURCE_ID_FONT_BOXY_OUTLINE_20));
@@ -505,12 +571,12 @@ static void window_load(Window *window) {
   lcd_date_font = fonts_load_custom_font(resource_get_handle(RESOURCE_ID_FONT_LCD_20));
 
   //Setup background layer for digital time display
-  digital_layer = layer_create(GRect(74 - 32, 106, 32 * 2, 24));
+  digital_layer = layer_create(GRect(center.x - 32, center.y + 22, 32 * 2, 24));
   layer_set_update_proc(digital_layer, digital_update_proc);
   layer_add_child(window_layer, digital_layer);
 
   //Setup background layer for digital date display
-  date_layer = layer_create(GRect(74 - 20, 28, 20 * 2, 40));
+  date_layer = layer_create(GRect(center.x - 20, center.y - 56, 20 * 2, 40));
   layer_set_update_proc(date_layer, date_update_proc);
   layer_add_child(window_layer, date_layer);
 
@@ -525,13 +591,18 @@ static void window_load(Window *window) {
   //Setup tick time handler
   tick_timer_service_subscribe((MINUTE_UNIT), tick_handler);
   
+  //Setup magic motion accel handler
+  //accel_data_service_subscribe(5, accel_handler);
+  //accel_service_set_sampling_rate(ACCEL_SAMPLING_10HZ);
+  light_enable(true);
+  looking = true;
+  register_timer(NULL);
 }
 
 static void window_unload(Window *window) {
 }
 
 static void init(void) {
-  light_enable(true);
   window = window_create();
   //window_set_fullscreen(window, true);
   window_set_background_color(window, GColorBlack);
